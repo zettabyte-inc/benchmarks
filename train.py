@@ -16,12 +16,13 @@ def parse_args():
     return parser.parse_args()
 
 def main():
+    # initialize distributed if launched under deepspeed or torch.distributed
+    torch.distributed.init_process_group(backend="nccl", init_method="env://")
     args = parse_args()
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda")
 
-    # Load tokenizer & model
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=False)
+    # Load model only (no tokenizer needed)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=torch.float16 if args.fp16 else torch.float32,
@@ -32,12 +33,10 @@ def main():
 
     # prepare dummy inputs
     per_gpu_batch = args.global_batch_size // torch.distributed.get_world_size()
-    input_ids = torch.randint(
-        0, tokenizer.vocab_size,
-        (per_gpu_batch, args.seq_length),
-        dtype=torch.long,
-        device=device
-    )
+    vocab_size = model.config.vocab_size
+    input_ids = torch.randint(0, vocab_size,
+                              (per_gpu_batch, args.seq_length),
+                              device=device, dtype=torch.long)
 
     # count params
     total_params = sum(p.numel() for p in model.parameters())
@@ -74,6 +73,6 @@ def main():
 
 if __name__ == "__main__":
     # initialize distributed if launched under deepspeed or torch.distributed
-    torch.distributed.init_process_group(backend="nccl", init_method="env://")
+    #torch.distributed.init_process_group(backend="nccl", init_method="env://")
     main()
 
