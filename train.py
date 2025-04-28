@@ -3,42 +3,43 @@ import os
 import argparse
 import time
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import LlamaConfig, LlamaForCausalLM
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Measure TFLOP/s per GPU")
-    parser.add_argument("--model_path", required=True, help="Path to a HF llama-3-8b or llama-3-70b folder")
-    parser.add_argument("--seq_length", type=int, default=4096)
-    parser.add_argument("--global_batch_size", type=int, default=1024)
-    parser.add_argument("--fp16", action="store_true")
-    # allow DeepSpeed’s local_rank
-    parser.add_argument("--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)))
-    return parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--model_path", required=True, help="Path to HF LLaMA config folder")
+    p.add_argument("--seq_length", type=int, default=4096)
+    p.add_argument("--global_batch_size", type=int, default=1024)
+    p.add_argument("--fp16", action="store_true")
+    p.add_argument("--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)))
+    return p.parse_args()
 
 def main():
     # initialize distributed if launched under deepspeed or torch.distributed
     torch.distributed.init_process_group(backend="nccl", init_method="env://")
     args = parse_args()
     torch.cuda.set_device(args.local_rank)
-    device = torch.device("cuda")
 
-    # Load model only (no tokenizer needed)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.float16 if args.fp16 else torch.float32,
-        low_cpu_mem_usage=True,
-        device_map={"": args.local_rank}
-    )
+    # load just the config and build a random-weight model
+    cfg = LlamaConfig.from_pretrained(args.model_path, trust_remote_code=False)
+    model = LlamaForCausalLM(cfg).to(args.local_rank)
+    if args.fp16:
+        model.half()
+
     model.eval()
 
-    # prepare dummy inputs
-    per_gpu_batch = args.global_batch_size // torch.distributed.get_world_size()
-    vocab_size = model.config.vocab_size
-    input_ids = torch.randint(0, vocab_size,
-                              (per_gpu_batch, args.seq_length),
-                              device=device, dtype=torch.long)
+    # dummy input batch (no tokenizer needed)
+    world_size = torch.distributed.get_world_size()
+    per_gpu_batch = args.global_batch_size // world_size
+    vocab_size = cfg.vocab_size
+    input_ids = torch.randint(
+        0, vocab_size,
+        (per_gpu_batch, args.seq_length),
+        dtype=torch.long,
+        device=args.local_rank
+    )
 
-    # count params
+    # measure inference flops
     total_params = sum(p.numel() for p in model.parameters())
     # FLOPs per token step ~ 2 × params
     flops_per_token = 2 * total_params
