@@ -1,57 +1,81 @@
-import time, torch
-import deepspeed
+#!/usr/bin/env python3
+import argparse
+import time
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 def parse_args():
-    import argparse
-    p=argparse.ArgumentParser()
-    p.add_argument('--model_path', required=True)
-    p.add_argument('--seq_length', type=int, default=4096)
-    p.add_argument('--global_batch_size', type=int, default=1024)
-    p.add_argument('--dp', type=int, default=1)
-    p.add_argument('--tp', type=int, default=1)
-    p.add_argument('--pp', type=int, default=1)
-    p.add_argument('--fp16', action='store_true')
-    return p.parse_args()
+    parser = argparse.ArgumentParser()
+    # swallow DeepSpeed’s local_rank flag
+    parser.add_argument("--local_rank", type=int, default=0, help="(unused) for deepspeed launcher")
 
-def get_batch(tok, sl, bs, device):
-    return torch.randint(0, tok.vocab_size, (bs, sl), device=device)
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        required=True,
+        help="Path to the pretrained LLaMA model"
+    )
+    parser.add_argument(
+        "--seq_length",
+        type=int,
+        default=4096,
+        help="Sequence length for training/inference"
+    )
+    parser.add_argument(
+        "--global_batch_size",
+        type=int,
+        default=1024,
+        help="Total batch size across all GPUs"
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Use mixed-precision"
+    )
+    return parser.parse_args()
 
 def main():
-    args=parse_args()
-    deepspeed.init_distributed()
+    args = parse_args()
 
-    ds_cfg = {
-      "train_micro_batch_size_per_gpu": args.global_batch_size//(args.dp*args.tp),
-      "gradient_accumulation_steps": 1,
-      "fp16": {"enabled": args.fp16},
-      "zero_optimization": {"stage": 0}
-    }
-    model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=(torch.float16 if args.fp16 else torch.float32))
-    model, _, _, _ = deepspeed.initialize(model=model, config=ds_cfg)
-    tok = AutoTokenizer.from_pretrained(args.model_path)
+    # set device
+    device = torch.device(f"cuda:{args.local_rank}")
 
-    batch = get_batch(tok, args.seq_length, ds_cfg["train_micro_batch_size_per_gpu"], model.local_rank)
-    # Warm-up
+    # load model & tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=False)
+    model = AutoModelForCausalLM.from_pretrained(args.model_path)
+    if args.fp16:
+        model = model.half()
+    model.to(device)
+    model.eval()
+
+    # prepare dummy input
+    batch_size_per_gpu = args.global_batch_size // torch.cuda.device_count()
+    dummy_input = torch.randint(
+        low=0,
+        high=tokenizer.vocab_size,
+        size=(batch_size_per_gpu, args.seq_length),
+        device=device,
+        dtype=torch.long
+    )
+
+    # warm-up
     for _ in range(5):
-        loss = model(batch, labels=batch).loss
-        model.backward(loss); model.step()
+        _ = model(dummy_input)
 
-    # Timed runs
-    steps=20
-    torch.cuda.synchronize(); t0=time.time()
-    for _ in range(steps):
-        loss = model(batch, labels=batch).loss
-        model.backward(loss); model.step()
-    torch.cuda.synchronize(); t1=time.time()
+    # timing
+    torch.cuda.synchronize()
+    start = time.time()
+    outputs = model(dummy_input)
+    torch.cuda.synchronize()
+    elapsed = time.time() - start
 
-    # Compute TFLOPs/GPU
-    total_p = sum(p.numel() for p in model.module.parameters())
-    flops = 2 * total_p * args.seq_length
-    secs = (t1-t0)/steps
-    tflops = flops / secs / 1e12
-    print(f"=== TFLOP/s per GPU: {tflops:.0f} ===")
+    # compute TFLOPS: roughly 2 * F * B * S / T
+    # F = number of parameters, B = batch, S = seq length, T = elapsed
+    num_params = sum(p.numel() for p in model.parameters())
+    tflops = 2 * num_params * batch_size_per_gpu * args.seq_length / (elapsed * 1e12)
 
-if __name__=='__main__':
+    if args.local_rank == 0:
+        print(f"Per-GPU throughput: {tflops:.1f} TFLOP/s on GPU {device}")
+
+if __name__ == "__main__":
     main()
-EOF
