@@ -1,63 +1,79 @@
+#!/usr/bin/env python3
+import os
 import argparse
 import time
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, required=True)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Measure TFLOP/s per GPU")
+    parser.add_argument("--model_path", required=True, help="Path to a HF llama-3-8b or llama-3-70b folder")
     parser.add_argument("--seq_length", type=int, default=4096)
     parser.add_argument("--global_batch_size", type=int, default=1024)
     parser.add_argument("--fp16", action="store_true")
-    args = parser.parse_args()
+    # allow DeepSpeed’s local_rank
+    parser.add_argument("--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)))
+    return parser.parse_args()
 
-    # distributed setup
-    torch.distributed.init_process_group(backend="nccl")
-    local_rank = torch.distributed.get_rank() % torch.cuda.device_count()
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
+def main():
+    args = parse_args()
+    torch.cuda.set_device(args.local_rank)
+    device = torch.device("cuda")
 
-    # load model config + weights
-    config = AutoConfig.from_pretrained(args.model_path)
-    model = AutoModelForCausalLM.from_pretrained(args.model_path)
-    if args.fp16:
-        model = model.half()
-    model.to(device)
+    # Load tokenizer & model
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=False)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=torch.float16 if args.fp16 else torch.float32,
+        low_cpu_mem_usage=True,
+        device_map={"": args.local_rank}
+    )
     model.eval()
 
-    # dummy input
-    batch_size_per_gpu = args.global_batch_size // torch.distributed.get_world_size()
-    vocab_size = config.vocab_size
-    dummy_input = torch.randint(
-        0, vocab_size,
-        (batch_size_per_gpu, args.seq_length),
-        dtype=torch.long, device=device
+    # prepare dummy inputs
+    per_gpu_batch = args.global_batch_size // torch.distributed.get_world_size()
+    input_ids = torch.randint(
+        0, tokenizer.vocab_size,
+        (per_gpu_batch, args.seq_length),
+        dtype=torch.long,
+        device=device
     )
+
+    # count params
+    total_params = sum(p.numel() for p in model.parameters())
+    # FLOPs per token step ~ 2 × params
+    flops_per_token = 2 * total_params
 
     # warm-up
     for _ in range(5):
         with torch.no_grad():
-            _ = model(dummy_input).logits
+            _ = model(input_ids).logits
 
-    # measure
-    torch.cuda.synchronize(device)
-    start = time.time()
+    # benchmark
     iters = 20
+    torch.distributed.barrier()
+    start = time.time()
     for _ in range(iters):
         with torch.no_grad():
-            _ = model(dummy_input).logits
-    torch.cuda.synchronize(device)
+            _ = model(input_ids).logits
+    torch.distributed.barrier()
     elapsed = time.time() - start
 
-    # TFLOPs/s per GPU = (2 * ops per token) * batch * seq / elapsed / 1e12
-    # ops per token ~ 6*N*H (approx), but we'll approximate with FLOPs from config
-    params = sum(p.numel() for p in model.parameters())
-    flops_per_token = 2 * params  # forward+backward roughly
-    total_tokens = batch_size_per_gpu * args.seq_length * iters
-    tflops_per_gpu = flops_per_token * total_tokens / elapsed / 1e12
+    steps_per_sec = iters / elapsed
+    # each forward is ~ flops_per_token × seq_length × batch_per_gpu
+    tflops_per_sec_per_gpu = (flops_per_token * args.seq_length * per_gpu_batch * steps_per_sec) / 1e12
 
-    if local_rank == 0:
-        print(f"Per-GPU throughput: {tflops_per_gpu:.2f} TFLOP/s")
+    if args.local_rank == 0:
+        print(f"\n=== Benchmark results ===")
+        print(f"Model:          {args.model_path}")
+        print(f"Total params:   {total_params/1e9:.2f} B")
+        print(f"seq_length:     {args.seq_length}")
+        print(f"global batch:   {args.global_batch_size}  (per GPU: {per_gpu_batch})")
+        print(f"Steps/sec/GPU:  {steps_per_sec:.2f}")
+        print(f"TFLOP/s/GPU:    {tflops_per_sec_per_gpu:.1f}\n")
 
 if __name__ == "__main__":
+    # initialize distributed if launched under deepspeed or torch.distributed
+    torch.distributed.init_process_group(backend="nccl", init_method="env://")
     main()
+
